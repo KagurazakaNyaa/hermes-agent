@@ -4726,7 +4726,106 @@ class BasePlatformAdapter(ABC):
         Default implementation returns content as-is.
         """
         return content
-    
+
+    @staticmethod
+    def _is_separator_row(line: str) -> bool:
+        """Return True if *line* is a Markdown table separator row.
+
+        Recognises patterns like ``|---|:---:|---|`` where every character
+        between pipes is a dash, colon, or whitespace."""
+        if not (line.startswith("|") and line.count("|") >= 2):
+            return False
+        _inner = line.strip("|").replace(" ", "")
+        return all(c in "-:|" for c in _inner) and "-" in _inner
+
+    @staticmethod
+    def _last_row_boundary(text: str, end: int) -> Optional[int]:
+        """Return the position of the last ``|``-prefix row boundary
+        before *end*, or None.
+
+        Handles both flush-left and indented table rows (``\\n|…``
+        and ``\\n  |…``)."""
+        # Try flush-left first (common case).
+        _pos = text.rfind("\n|", 0, end)
+        if _pos >= 0:
+            return _pos
+        # Try with leading whitespace (indented table).
+        _pos = text.rfind("\n", 0, end)
+        if _pos < 0:
+            return None
+        _stripped = text[_pos + 1 : end].lstrip()
+        if _stripped.startswith("|"):
+            return _pos + len(text[_pos + 1 : end]) - len(_stripped)
+        return None
+
+    @staticmethod
+    def _adjust_split_for_markdown_table(
+        remaining: str, split_at: int,
+    ) -> int:
+        """If *split_at* falls inside a Markdown table, walk back to the
+        nearest table-row boundary so the chunk ends with a complete row.
+
+        A table is recognised as consecutive ``| … |`` lines with at least
+        one separator row (``|----|----|``) among them.  The separator may
+        appear above the split point (typical) or immediately below it
+        (when the split lands on the header row).
+
+        Returns the adjusted *split_at* position, or the original value if
+        no table boundary is found."""
+        candidate = remaining[:split_at]
+        _candidate_lines = candidate.split("\n")
+        if not _candidate_lines:
+            return split_at
+
+        # The split lands on a line that starts with | (possibly indented).
+        _last_stripped = _candidate_lines[-1].strip()
+        if not _last_stripped.startswith("|"):
+            return split_at
+
+        # ── 1. Check whether *this* line is a separator row ──────────
+        if BasePlatformAdapter._is_separator_row(_last_stripped):
+            # Split at previous newline so the separator stays intact.
+            _prev_nl = BasePlatformAdapter._last_row_boundary(candidate, split_at)
+            if _prev_nl is not None:
+                return _prev_nl + 1
+            return split_at
+
+        # ── 2. Scan upward for a separator row ───────────────────────
+        for _li in range(len(_candidate_lines) - 2, -1, -1):
+            _line = _candidate_lines[_li].strip()
+            if BasePlatformAdapter._is_separator_row(_line):
+                _prev_nl = BasePlatformAdapter._last_row_boundary(candidate, split_at)
+                if _prev_nl is not None:
+                    return _prev_nl + 1
+                # Table starts at position 0 in ``remaining`` — no
+                # preceding newline.  Split after the current row.
+                if "\n" not in candidate:
+                    _next_nl = remaining.find("\n", split_at)
+                    return _next_nl + 1 if _next_nl > 0 else split_at
+                return split_at
+            if not _line.startswith("|"):
+                break
+
+        # ── 3. Scan forward: split may land on the header row ────────
+        # (the row *above* the separator).  Check the next line(s) in
+        # ``remaining`` for a separator row.
+        _after = remaining[split_at:].lstrip("\n")
+        _after_lines = _after.split("\n", 2)
+        for _next_line in _after_lines[:2]:
+            if BasePlatformAdapter._is_separator_row(_next_line.strip()):
+                _prev_nl = BasePlatformAdapter._last_row_boundary(candidate, split_at)
+                if _prev_nl is not None:
+                    return _prev_nl + 1
+                # Table starts at position 0 in ``remaining``.
+                if "\n" not in candidate:
+                    _next_nl = remaining.find("\n", split_at)
+                    return _next_nl + 1 if _next_nl > 0 else split_at
+                return split_at
+            if not _next_line.strip().startswith("|"):
+                break
+
+        return split_at
+
     @staticmethod
     def truncate_message(
         content: str,
@@ -4822,46 +4921,10 @@ class BasePlatformAdapter(ABC):
                         split_at = safe_split
 
             # ── Table boundary detection ──────────────────────────────
-            # Don't split inside a Markdown table.  Tables are recognised
-            # as consecutive lines matching | … |, with a separator row
-            # (|----|----|) somewhere above.  When the split falls inside
-            # a table, walk back to the nearest row boundary (previous \n)
-            # so each chunk gets complete table rows.
-            candidate = remaining[:split_at]
-            _candidate_lines = candidate.split("\n")
-            if _candidate_lines and _candidate_lines[-1].strip().startswith("|"):
-                # We're inside a potential table row.  Walk upward to
-                # confirm we're in a table (find separator row above).
-                _in_table = False
-                for _li in range(len(_candidate_lines) - 2, -1, -1):
-                    _line = _candidate_lines[_li].strip()
-                    # Separator row: |---|---|
-                    if _line.startswith("|") and _line.count("|") >= 2:
-                        _inner = _line.strip("|").replace(" ", "")
-                        if all(c in "-:|" for c in _inner) and "-" in _inner:
-                            _in_table = True
-                            break
-                    # Non-table line: stop looking
-                    if not _line.startswith("|"):
-                        break
-                if _in_table:
-                    # Walk back to the last | row boundary before split_at
-                    _prev_row = candidate.rfind("\n|", 0, split_at)
-                    if _prev_row > 0:
-                        # +1 to include the \n before the row, so the
-                        # previous chunk ends cleanly after its last row
-                        split_at = _prev_row + 1
-                    elif _prev_row == 0:
-                        # Table starts at position 0 — can't split before it.
-                        # Split after the current row instead.
-                        _next_nl = remaining.find("\n", split_at)
-                        if _next_nl > 0:
-                            split_at = _next_nl
-                        else:
-                            # Entire remaining content is one table row;
-                            # fall through to normal split.
-                            pass
-            # ── End table boundary detection ──────────────────────────
+            # Don't split inside a Markdown table.  Walk the split point
+            # back to the nearest table-row boundary.  See the helper
+            # ``_adjust_split_for_markdown_table`` for details.
+            split_at = BasePlatformAdapter._adjust_split_for_markdown_table(remaining, split_at)
 
             chunk_body = remaining[:split_at]
             remaining = remaining[split_at:].lstrip()
