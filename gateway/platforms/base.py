@@ -491,6 +491,11 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.helpers import (
+    TABLE_SEPARATOR_RE,
+    is_table_row,
+    split_markdown_table_row,
+)
 from gateway.session import SessionSource, build_session_key
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
 
@@ -5521,37 +5526,181 @@ class BasePlatformAdapter(ABC):
     def _is_separator_row(line: str) -> bool:
         """Return True if *line* is a Markdown table separator row.
 
-        Recognises patterns like ``|---|:---:|---|`` where every character
-        between pipes is a dash, colon, or whitespace."""
-        if not (line.startswith("|") and line.count("|") >= 2):
+        Recognises GFM delimiter rows with optional outer pipes, e.g.
+        ``|---|:---:|---|`` and ``--- | :---: | ---``."""
+        _stripped = line.strip()
+        if "|" not in _stripped or "-" not in _stripped:
             return False
-        _inner = line.strip("|")
-        # Strip all whitespace (spaces, tabs, non-breaking spaces, etc.)
-        _inner = re.sub(r"\s", "", _inner)
-        return all(c in "-:|" for c in _inner) and "-" in _inner
+        if TABLE_SEPARATOR_RE.match(_stripped):
+            return True
+        return bool(re.match(r"^\|\s*:?-+:?\s*\|$", _stripped))
 
     @staticmethod
     def _last_row_boundary(text: str, end: int) -> Optional[int]:
-        """Return the position of the last newline before a ``|``-prefix
-        table row boundary before *end*, or None.
+        """Return the position of the last newline before a table row
+        boundary before *end*, or None.
 
-        Handles both flush-left and indented table rows (``\\n|…``
-        and ``\\n  |…``).  Returns the *newline* index (not the ``|``
-        position), so callers add ``+ 1`` to skip the newline (producing
-        a chunk that ends at the newline and a subsequent chunk that
-        starts with the table row, preserving any leading indentation)."""
-        # Try flush-left first (common case).
-        _pos = text.rfind("\n|", 0, end)
-        if _pos >= 0:
-            return _pos
-        # Try with leading whitespace (indented table).
-        _pos = text.rfind("\n", 0, end)
-        if _pos < 0:
-            return None
-        _trailing = text[_pos + 1 : end]
-        if _trailing.lstrip().startswith("|"):
-            return _pos
+        Handles flush-left, indented, and optional-outer-pipe GFM table
+        rows.  Returns the *newline* index, so callers add ``+ 1`` to
+        start the next chunk at the row while preserving indentation."""
+        _end = min(end, len(text))
+        _segment_end = _end
+        while _segment_end > 0:
+            _pos = text.rfind("\n", 0, _segment_end)
+            if _pos < 0:
+                return None
+            _trailing = text[_pos + 1 : _segment_end]
+            if is_table_row(_trailing) or BasePlatformAdapter._is_separator_row(_trailing):
+                return _pos
+            _segment_end = _pos
         return None
+
+    @staticmethod
+    def _line_bounds(text: str, index: int) -> tuple[int, int]:
+        """Return start/end offsets for the logical line containing *index*."""
+        _index = max(0, min(index, len(text)))
+        _start = text.rfind("\n", 0, _index) + 1
+        _end = text.find("\n", _index)
+        if _end < 0:
+            _end = len(text)
+        return _start, _end
+
+    @staticmethod
+    def _next_line_bounds(text: str, line_end: int) -> Optional[tuple[int, int]]:
+        """Return bounds for the logical line immediately after *line_end*."""
+        _next_start = line_end + 1
+        if _next_start >= len(text):
+            return None
+        _next_end = text.find("\n", _next_start)
+        if _next_end < 0:
+            _next_end = len(text)
+        return _next_start, _next_end
+
+    @staticmethod
+    def _previous_line_bounds(text: str, line_start: int) -> Optional[tuple[int, int]]:
+        """Return bounds for the logical line immediately before *line_start*."""
+        _prev_end = line_start - 1
+        if _prev_end < 0:
+            return None
+        _prev_start = text.rfind("\n", 0, _prev_end) + 1
+        return _prev_start, _prev_end
+
+    @staticmethod
+    def _markdown_table_cell_count(line: str) -> int:
+        """Return the number of cells in a possible GFM table row."""
+        return len(split_markdown_table_row(line))
+
+    @staticmethod
+    def _is_confirmed_markdown_table_delimiter(
+        text: str, line_start: int, line_end: int,
+    ) -> bool:
+        """Return True when a delimiter has a matching immediate header."""
+        _line = text[line_start:line_end]
+        if not BasePlatformAdapter._is_separator_row(_line):
+            return False
+        _prev_bounds = BasePlatformAdapter._previous_line_bounds(text, line_start)
+        if _prev_bounds is None:
+            return False
+        _prev_start, _prev_end = _prev_bounds
+        _prev_line = text[_prev_start:_prev_end]
+        if not is_table_row(_prev_line) or BasePlatformAdapter._is_separator_row(_prev_line):
+            return False
+        return (
+            BasePlatformAdapter._markdown_table_cell_count(_prev_line)
+            == BasePlatformAdapter._markdown_table_cell_count(_line)
+        )
+
+    @staticmethod
+    def _is_confirmed_markdown_table_header(
+        text: str, line_start: int, line_end: int,
+    ) -> bool:
+        """Return True when a header has a matching immediate delimiter."""
+        _line = text[line_start:line_end]
+        if not is_table_row(_line) or BasePlatformAdapter._is_separator_row(_line):
+            return False
+        _next_bounds = BasePlatformAdapter._next_line_bounds(text, line_end)
+        if _next_bounds is None:
+            return False
+        _next_start, _next_end = _next_bounds
+        _next_line = text[_next_start:_next_end]
+        if not BasePlatformAdapter._is_separator_row(_next_line):
+            return False
+        return (
+            BasePlatformAdapter._markdown_table_cell_count(_line)
+            == BasePlatformAdapter._markdown_table_cell_count(_next_line)
+        )
+
+    @staticmethod
+    def _next_content_line_bounds(text: str, index: int) -> Optional[tuple[int, int]]:
+        """Return bounds for the next non-newline continuation line."""
+        _index = max(0, min(index, len(text)))
+        while _index < len(text) and text[_index] == "\n":
+            _index += 1
+        if _index >= len(text):
+            return None
+        _end = text.find("\n", _index)
+        if _end < 0:
+            _end = len(text)
+        return _index, _end
+
+    @staticmethod
+    def _line_is_in_markdown_table(text: str, line_start: int, line_end: int) -> bool:
+        """Return True when the logical line is part of a GFM table."""
+        _line = text[line_start:line_end]
+        if not (is_table_row(_line) or BasePlatformAdapter._is_separator_row(_line)):
+            return False
+        if BasePlatformAdapter._is_separator_row(_line):
+            return BasePlatformAdapter._is_confirmed_markdown_table_delimiter(
+                text, line_start, line_end
+            )
+
+        if BasePlatformAdapter._is_confirmed_markdown_table_header(
+            text, line_start, line_end
+        ):
+            return True
+
+        _prev_end = line_start - 1
+        while _prev_end > 0:
+            _prev_start = text.rfind("\n", 0, _prev_end) + 1
+            _prev_line = text[_prev_start:_prev_end]
+            if BasePlatformAdapter._is_separator_row(_prev_line):
+                return BasePlatformAdapter._is_confirmed_markdown_table_delimiter(
+                    text, _prev_start, _prev_end
+                )
+            if not is_table_row(_prev_line):
+                break
+            _prev_end = _prev_start - 1
+
+        return False
+
+    @staticmethod
+    def _should_preserve_table_indent_after_split(text: str, split_at: int) -> bool:
+        """Return True when continuation begins with an indented table row."""
+        _bounds = BasePlatformAdapter._next_content_line_bounds(text, split_at)
+        if _bounds is None:
+            return False
+        _line_start, _line_end = _bounds
+        _line = text[_line_start:_line_end]
+        if _line[:1] not in {" ", "\t"}:
+            return False
+        return BasePlatformAdapter._line_is_in_markdown_table(text, _line_start, _line_end)
+
+    @staticmethod
+    def _adjust_split_for_markdown_table_with_metadata(
+        remaining: str, split_at: int,
+    ) -> tuple[int, bool]:
+        """Return adjusted split and whether continuation indentation is table-significant."""
+        _line_start, _line_end = BasePlatformAdapter._line_bounds(remaining, split_at)
+        _adjusted = split_at
+        if BasePlatformAdapter._line_is_in_markdown_table(remaining, _line_start, _line_end):
+            _prev_nl = BasePlatformAdapter._last_row_boundary(remaining, _line_end)
+            if _prev_nl is not None:
+                _adjusted = _prev_nl + 1
+
+        _preserve_indent = BasePlatformAdapter._should_preserve_table_indent_after_split(
+            remaining, _adjusted
+        )
+        return _adjusted, _preserve_indent
 
     @staticmethod
     def _adjust_split_for_markdown_table(
@@ -5560,63 +5709,18 @@ class BasePlatformAdapter(ABC):
         """If *split_at* falls inside a Markdown table, walk back to the
         nearest table-row boundary so the chunk ends with a complete row.
 
-        A table is recognised as consecutive ``| … |`` lines with at least
-        one separator row (``|----|----|``) among them.  The separator may
-        appear above the split point (typical) or immediately below it
-        (when the split lands on the header row).
+        A table is recognised as consecutive pipe-delimited lines, with or
+        without outer pipes, anchored by a header followed immediately by a
+        delimiter row with the same number of cells.  The delimiter may appear
+        above the split point (typical) or immediately below it (when the split
+        lands on the header row).
 
         Returns the adjusted *split_at* position, or the original value if
         no table boundary is found."""
-        candidate = remaining[:split_at]
-        _candidate_lines = candidate.split("\n")
-        if not _candidate_lines:
-            return split_at
-
-        # The split lands on a line that starts with | (possibly indented).
-        _last_stripped = _candidate_lines[-1].strip()
-        if not _last_stripped.startswith("|"):
-            return split_at
-
-        # ── 1. Check whether *this* line is a separator row ──────────
-        if BasePlatformAdapter._is_separator_row(_last_stripped):
-            # Split at previous newline so the separator stays intact.
-            _prev_nl = BasePlatformAdapter._last_row_boundary(candidate, split_at)
-            if _prev_nl is not None:
-                return _prev_nl + 1
-            return split_at
-
-        # ── 2. Scan upward for a separator row ───────────────────────
-        for _li in range(len(_candidate_lines) - 2, -1, -1):
-            _line = _candidate_lines[_li].strip()
-            if BasePlatformAdapter._is_separator_row(_line):
-                _prev_nl = BasePlatformAdapter._last_row_boundary(candidate, split_at)
-                if _prev_nl is not None:
-                    return _prev_nl + 1
-                # Table starts at position 0 in ``remaining`` — no
-                # preceding newline to walk back to.  Returning the
-                # original *split_at* (which is guaranteed ≤ the
-                # computed safe split) preserves the max-length
-                # invariant; never forward-adjust.
-                return split_at
-            if not _line.startswith("|"):
-                break
-
-        # ── 3. Scan forward: split may land on the header row ────────
-        # (the row *above* the separator).  Check the next line(s) in
-        # ``remaining`` for a separator row.
-        _after = remaining[split_at:].lstrip("\n")
-        _after_lines = _after.split("\n", 2)
-        for _next_line in _after_lines[:2]:
-            if BasePlatformAdapter._is_separator_row(_next_line.strip()):
-                _prev_nl = BasePlatformAdapter._last_row_boundary(candidate, split_at)
-                if _prev_nl is not None:
-                    return _prev_nl + 1
-                # Table starts at position 0 — same reasoning as step 2.
-                return split_at
-            if not _next_line.strip().startswith("|"):
-                break
-
-        return split_at
+        adjusted, _ = BasePlatformAdapter._adjust_split_for_markdown_table_with_metadata(
+            remaining, split_at
+        )
+        return adjusted
 
     @staticmethod
     def truncate_message(
@@ -5715,11 +5819,17 @@ class BasePlatformAdapter(ABC):
             # ── Table boundary detection ──────────────────────────────
             # Don't split inside a Markdown table.  Walk the split point
             # back to the nearest table-row boundary.  See the helper
-            # ``_adjust_split_for_markdown_table`` for details.
-            split_at = BasePlatformAdapter._adjust_split_for_markdown_table(remaining, split_at)
+            # ``_adjust_split_for_markdown_table_with_metadata`` for details.
+            split_at, preserves_indented_table = (
+                BasePlatformAdapter._adjust_split_for_markdown_table_with_metadata(remaining, split_at)
+            )
 
             chunk_body = remaining[:split_at]
-            remaining = remaining[split_at:].lstrip("\n")
+            next_remaining = remaining[split_at:]
+            if preserves_indented_table:
+                remaining = next_remaining.lstrip("\n")
+            else:
+                remaining = next_remaining.lstrip()
 
             full_chunk = prefix + chunk_body
 

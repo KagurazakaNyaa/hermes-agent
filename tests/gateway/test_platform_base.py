@@ -1562,6 +1562,9 @@ class TestIsSeparatorRow:
     def test_alignment_colons(self):
         assert BasePlatformAdapter._is_separator_row("|:---|:---:|") is True
 
+    def test_optional_outer_pipes(self):
+        assert BasePlatformAdapter._is_separator_row("--- | :---: | ---") is True
+
     def test_data_row_not_separator(self):
         assert BasePlatformAdapter._is_separator_row("| col1 | col2 |") is False
 
@@ -1570,6 +1573,18 @@ class TestIsSeparatorRow:
 
     def test_plain_text_not_separator(self):
         assert BasePlatformAdapter._is_separator_row("just text") is False
+
+    def test_obvious_non_candidate_skips_shared_regex(self, monkeypatch):
+        class UnexpectedRegex:
+            def match(self, _line):
+                raise AssertionError("shared regex should not run")
+
+        monkeypatch.setattr(
+            "gateway.platforms.base.TABLE_SEPARATOR_RE",
+            UnexpectedRegex(),
+        )
+        assert BasePlatformAdapter._is_separator_row((" " * 20_000) + "x") is False
+        assert BasePlatformAdapter._is_separator_row("| ordinary prose |") is False
 
     def test_single_pipe_not_separator(self):
         assert BasePlatformAdapter._is_separator_row("| only one pipe") is False
@@ -1601,6 +1616,13 @@ class TestLastRowBoundary:
         # pos should be right before the '|' of "  | data |"
         assert pos is not None
         assert text[pos:].lstrip().startswith("| data")
+
+    def test_optional_outer_pipe_table_row(self):
+        text = "abc\ncol1 | col2\ndata | value"
+        end = len(text)
+        pos = BasePlatformAdapter._last_row_boundary(text, end)
+        assert pos is not None
+        assert text[pos + 1:].startswith("data | value")
 
     def test_no_table_row(self):
         text = "plain\ntext\nwithout pipes"
@@ -1660,6 +1682,18 @@ class TestAdjustSplitForMarkdownTable:
         result = BasePlatformAdapter._adjust_split_for_markdown_table(text, split_at)
         assert result == text.index("| data |")  # start of data row
 
+    def test_outer_pipe_free_data_row_walks_back_before_first_pipe(self):
+        text = "before\nHeader | Value\n--- | ---\nalpha | beta\nmore"
+        split_at = text.index("alpha") + 2
+        result = BasePlatformAdapter._adjust_split_for_markdown_table(text, split_at)
+        assert result == text.index("alpha | beta")
+
+    def test_mismatched_header_delimiter_counts_do_not_confirm_table(self):
+        text = "before\nHeader | Value | Extra\n--- | ---\nalpha | beta | gamma\nmore"
+        split_at = text.index("alpha") + 2
+        result = BasePlatformAdapter._adjust_split_for_markdown_table(text, split_at)
+        assert result == split_at
+
     # ── Header-row cases (step 3) ───────────────────────────────
 
     def test_header_row_with_separator_below_walks_back(self):
@@ -1669,6 +1703,24 @@ class TestAdjustSplitForMarkdownTable:
         split_at = text.index("\n|---|")
         result = BasePlatformAdapter._adjust_split_for_markdown_table(text, split_at)
         assert result == text.index("| Header |")  # start of header row
+
+    def test_outer_pipe_free_header_row_with_separator_below_walks_back(self):
+        text = "before\nHeader | Value\n--- | ---\nalpha | beta\nmore"
+        split_at = text.index("\n--- | ---")
+        result = BasePlatformAdapter._adjust_split_for_markdown_table(text, split_at)
+        assert result == text.index("Header | Value")
+
+    def test_mismatched_header_and_separator_is_not_rewound(self):
+        text = "before\nHeader | Value\n--- | --- | ---\nalpha | beta"
+        split_at = text.index("Header") + 2
+        result = BasePlatformAdapter._adjust_split_for_markdown_table(text, split_at)
+        assert result == split_at
+
+    def test_pipe_prose_before_table_is_not_rewound(self):
+        text = "before\n  ordinary | prose\nHeader | Value\n--- | ---\nalpha | beta"
+        split_at = text.index("ordinary") + 2
+        result = BasePlatformAdapter._adjust_split_for_markdown_table(text, split_at)
+        assert result == split_at
 
     # ── Indented table ──────────────────────────────────────────
 
@@ -1785,6 +1837,60 @@ class TestTruncateMessageTableAware:
                     assert stripped.endswith("|") or "---" in stripped, (
                         f"Partial indented table row: {stripped!r}"
                     )
+
+    def test_outer_pipe_free_table_not_broken(self):
+        """GFM tables without outer pipes must also keep rows intact."""
+        table = (
+            "Col A | Col B | Col C\n"
+            "----- | ----- | -----\n"
+            "val1 | val2 | val3\n"
+            "val4 | val5 | val6\n"
+            "val7 | val8 | val9\n"
+        )
+        msg = f"Intro text here.\n{table}\nPostamble text."
+        chunks = BasePlatformAdapter.truncate_message(msg, max_length=85)
+        assert len(chunks) > 1
+        for chunk in chunks:
+            assert len(chunk) <= 85
+            for line in chunk.split("\n"):
+                stripped = line.strip()
+                if "|" in stripped and "(" not in stripped:
+                    assert stripped.count("|") >= 2, f"Partial table row: {stripped!r}"
+
+    def test_ordinary_continuation_trims_spaces_and_tabs(self):
+        msg = ("x" * 60) + "   \tcontinued after whitespace"
+        chunks = BasePlatformAdapter.truncate_message(msg, max_length=80)
+        assert len(chunks) > 1
+        assert chunks[1].startswith("continued")
+
+    def test_adjusted_indented_table_continuation_preserves_indent(self):
+        table = (
+            "  | Col A | Col B |\n"
+            "  |-------|-------|\n"
+            "  | x1    | y1    |\n"
+            "  | x2    | y2    |\n"
+        )
+        msg = f"{'padding ' * 8}\n{table}tail"
+        chunks = BasePlatformAdapter.truncate_message(msg, max_length=82)
+        assert len(chunks) > 1
+        assert any(chunk.startswith("  |") for chunk in chunks[1:])
+        for chunk in chunks:
+            assert len(chunk) <= 82
+
+    def test_natural_boundary_indented_table_continuation_preserves_indent(self):
+        msg = ("x" * 60) + "\n  | H | V |\n  |---|---|\n  | a | b |"
+        for max_length in (80, 84):
+            chunks = BasePlatformAdapter.truncate_message(msg, max_length=max_length)
+            assert len(chunks) > 1
+            assert chunks[1].startswith("  | H | V |")
+            for chunk in chunks:
+                assert len(chunk) <= max_length
+
+    def test_standalone_indented_delimiter_continuation_trims_indent(self):
+        msg = ("x" * 60) + "\n  --- | ---\ncontinued"
+        chunks = BasePlatformAdapter.truncate_message(msg, max_length=80)
+        assert len(chunks) > 1
+        assert chunks[1].startswith("--- | ---")
 
     def test_table_at_start_of_message(self):
         """Table at position 0 still splits correctly."""
